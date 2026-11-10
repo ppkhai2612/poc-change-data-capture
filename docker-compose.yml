@@ -1,0 +1,185 @@
+version: '3.8'
+services:
+  # Zookeeper: Distributed coordination service that maintains configuration information,
+  # provides distributed synchronization, and group services.
+  # In this setup, it manages Kafka brokers and helps in leader election, topic configuration.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - cdc-network
+
+  # Kafka: Distributed event streaming platform capable of handling trillions of events a day.
+  # It provides a unified, high-throughput, low-latency platform for handling real-time data feeds.
+  # Used here as the central messaging system for change data capture events.
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - cdc-network
+    
+  # Feature Usage Stream: Stream processor for real-time analytics
+  feature-usage-stream:
+    build:
+      context: ./feature-usage-stream
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports:
+      - "8082:8082"
+    networks:
+      - cdc-network
+
+  # Schema Registry: Provides a RESTful interface for storing and retrieving Avro schemas.
+  # It ensures schema compatibility and prevents incompatible schema changes.
+  # Acts as a central repository for data formats and structures of Kafka messages.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+    networks:
+      - cdc-network
+
+  # Debezium Connect: Kafka Connect framework with Debezium connectors for CDC (Change Data Capture).
+  # It monitors database changes and converts them into Kafka events.
+  # Enables real-time data integration from databases to other systems through Kafka.
+  connect:
+    image: debezium/connect:2.5
+    depends_on:
+      - kafka
+      - schema-registry
+      - postgres
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-statuses
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: false
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: false
+      PLUGIN_PATH: /kafka/connect/debezium-plugins,/kafka/connect/jdbc-connector
+    volumes:
+      - ./jdbc-connector:/kafka/connect/jdbc-connector
+    networks:
+      - cdc-network
+
+  # PosgreSQL: Open-source relational database.
+  # In this CDC setup, it serves as the source database
+  # that Debezium monitors for changes. These changes are then captured and
+  # streamed to Kafka for downstream processing.
+  postgres:
+    image: quay.io/debezium/postgres:15
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: saas_db
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - cdc-network
+
+  # OLAP PosgreSQL: Open-source relational database.
+  # In this CDC setup, it serves as the target database
+  # that receives the changes captured by Debezium from the source database.
+  # It is used for analytical processing and reporting.
+  # The data from the source database is transformed and loaded into this OLAP
+  olap-postgres:
+    image: postgres:15
+    ports:
+      - 5433:5432
+    environment:
+      POSTGRES_USER: olap_user
+      POSTGRES_PASSWORD: olap_pass
+      POSTGRES_DB: olap_db
+    volumes:
+      - ./olap-postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - cdc-network
+
+  # Kafka UI: Web interface for monitoring and managing Kafka clusters.
+  # Provides visualization of topics, consumer groups, messages, and overall
+  # Kafka ecosystem health. Useful for debugging and monitoring CDC event flows.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - cdc-network
+
+  # Python consumer for updating OLAP database from Kafka
+  feature-counts-consumer:
+    build:
+      context: ./python
+    depends_on:
+      - kafka
+      - olap-postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OLAP_DB_HOST: olap-postgres
+      OLAP_DB_PORT: 5432
+      OLAP_DB_NAME: olap_db
+      OLAP_DB_USER: olap_user
+      OLAP_DB_PASSWORD: olap_pass
+    networks:
+      - cdc-network
+
+  # Superset: Open-source data visualization and exploration platform.
+  # It connects to the OLAP PostgreSQL database to provide interactive dashboards.
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    ports:
+      - "8088:8088"
+    environment:
+      - SUPERSET_LOAD_EXAMPLES=no
+      - SUPERSET_SECRET_KEY="\xfd\x7f\x82\xd1\x14\xa1\xc0e\xbb\xb6f\xd9\x86\xc1\xb9\xd5\xab\x8b\xcfNG\xa7{"
+      - SUPERSET_WEBSERVER_ADDRESS=0.0.0.0
+    volumes:
+      - superset_home:/app/superset_home
+    depends_on:
+      - olap-postgres
+    command: >
+      /bin/bash -c "
+        superset db upgrade &&
+        superset fab create-admin --username admin --firstname admin --lastname user --email admin@example.com --password admin &&
+        superset init &&
+        superset run -p 8088 --host=0.0.0.0 --with-threads --reload --debugger"
+    networks:
+      - cdc-network
+
+
+networks:
+  cdc-network:
+    driver: bridge
+
+volumes:
+  superset_home:
+    driver: local
